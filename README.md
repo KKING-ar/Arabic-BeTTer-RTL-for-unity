@@ -55,6 +55,27 @@ against the actual shaped glyph widths and breaks lines *before*
 reordering, so line order always stays correct. Turn on **Fixed Wrap** too
 if you want a stable wrap width regardless of the box's live size.
 
+### Tags spanning multiple words or lines
+
+A tag wrapping several words (`<align="right">word1 word2</align>`) comes
+out as exactly one open + one close, in the order you wrote them — the
+content inside gets reordered, the tag itself never does. If Rtl Wrap
+breaks that span across physical lines, only the lines it actually touches
+get a copy (closed at the end, reopened at the start of the next), not
+every word.
+
+**Reverse Tags:** some RTL-aware editors store tags backwards —
+`</align>content<align="right">` instead of `<align="right">content</align>` —
+because the closing marker gets typed before the opening one. Tick
+**Reverse Tags** if that's how your source text looks, and it's normalized
+to standard order automatically (nested reversed tags too).
+
+**Align Right:** sets the text's default alignment — ON = right, OFF = left.
+Only changes horizontal alignment; Top/Middle/Bottom is left alone. An
+inline `<align=...>` tag in the text still overrides this for its own span.
+**Always Right** is a lock underneath it: when ON, it forces right
+regardless of what Align Right is set to.
+
 ## Usage (code) — switching language at runtime
 
 The whole point of driving this through code is that a language change is
@@ -111,6 +132,7 @@ never touched, so tag syntax can't break.
 namespace ArabicUnityRTL.Core {
     public static class ArabicFixer {
         public static string Fix(string input); // shape + reorder a (possibly multi-line) string
+        public static string NormalizeReversedTags(string input); // fix backwards </tag>...<tag> pairs
     }
 }
 
