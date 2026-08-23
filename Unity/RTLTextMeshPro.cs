@@ -67,6 +67,15 @@ namespace ArabicUnityRTL.Unity
         [Tooltip("The width (in the TMP component's local units) used for wrapping when Fixed Wrap is enabled. Ignored while Fixed Wrap is off.")]
         [SerializeField] private float fixedWrapWidth = 400f;
 
+        [Tooltip("Turn this on if your Source Text was authored with tags written BACKWARDS - \"</tag>content<tag=attrs>\" instead of the normal \"<tag=attrs>content</tag>\". This happens when tags get typed/pasted inside an RTL-aware text editor, which can store the closing marker before the opening one. When enabled, every tag in Source Text is assumed to follow this reversed convention and gets normalized into standard order before anything else runs. Leave OFF if your tags are already in normal order.")]
+        [SerializeField] private bool reverseTags = false;
+
+        [Tooltip("R/L Aligner: sets the text's default horizontal alignment. ON = Right, OFF = Left. Only changes the horizontal component - whatever vertical alignment (Top/Middle/Bottom) is already set on the TMP component is left untouched. Any inline <align=...> tag inside the text still overrides this for its own span, same as normal TMP behavior.")]
+        [SerializeField] private bool alignRight = true;
+
+        [Tooltip("Sub-option of the R/L Aligner above: when ON, this OVERRIDES Align Right and always forces Right alignment, regardless of the Align Right toggle's own state. Useful as a quick 'always right, no matter what' lock.")]
+        [SerializeField] private bool alwaysRight = false;
+
         private TMP_Text _text;
         private float _lastLiveWidth = float.NaN;
 
@@ -150,8 +159,11 @@ namespace ArabicUnityRTL.Unity
             sourceText = raw ?? string.Empty;
             if (Text == null) return;
 
+            ApplyAlignment();
+            string workingText = reverseTags ? ArabicFixer.NormalizeReversedTags(sourceText) : sourceText;
+
             Text.enableWordWrapping = false;
-            Text.text = BuildWrappedProcessedText(sourceText, maxWidth);
+            Text.text = BuildWrappedProcessedText(workingText, maxWidth);
         }
 
         /// <summary>
@@ -166,23 +178,28 @@ namespace ArabicUnityRTL.Unity
         private string BuildWrappedProcessedText(string raw, float maxWidth)
         {
             string[] paragraphs = (raw ?? string.Empty).Split('\n');
-            List<string> outputLines = new List<string>();
+            List<string> allOutputLines = new List<string>();
 
             foreach (string paragraph in paragraphs)
             {
-                if (paragraph.Length == 0) { outputLines.Add(string.Empty); continue; }
+                if (paragraph.Length == 0) { allOutputLines.Add(string.Empty); continue; }
 
                 string[] words = paragraph.Split(' ');
+                List<string> outputLines = new List<string>();
+                int[] wordToLine = new int[words.Length];
                 StringBuilder currentLine = new StringBuilder();
+                int lineIdx = 0;
 
-                foreach (string word in words)
+                for (int wi = 0; wi < words.Length; wi++)
                 {
+                    string word = words[wi];
                     string candidate = currentLine.Length == 0 ? word : currentLine + " " + word;
                     float width = MeasureWidth(candidate);
 
                     if (width > maxWidth && currentLine.Length > 0)
                     {
                         outputLines.Add(currentLine.ToString());
+                        lineIdx++;
                         currentLine.Clear();
                         currentLine.Append(word);
                     }
@@ -191,11 +208,66 @@ namespace ArabicUnityRTL.Unity
                         if (currentLine.Length > 0) currentLine.Append(' ');
                         currentLine.Append(word);
                     }
+                    wordToLine[wi] = lineIdx;
                 }
                 if (currentLine.Length > 0) outputLines.Add(currentLine.ToString());
+
+                // A wrapping tag pair (e.g. <align=...>...</align>) that
+                // WRAPPING just split across two or more physical lines
+                // needs closing off at the end of every line it touches
+                // (except the one with its real close) and reopening at the
+                // start of every line after the one with its real open -
+                // i.e. exactly the lines the tag actually spans get a copy,
+                // not every word. A tag that stayed fully within ONE
+                // physical line is left completely untouched here -
+                // ArabicFixer.Fix() below already keeps a same-line pair
+                // exactly as authored, in the correct open-before-close
+                // order, no matter how many words it wraps.
+                List<ArabicFixer.TagPair> pairs = ArabicFixer.FindTopLevelTagPairs(paragraph);
+                if (pairs.Count > 0)
+                {
+                    int[] wordStart = new int[words.Length];
+                    int pos = 0;
+                    for (int wi = 0; wi < words.Length; wi++) { wordStart[wi] = pos; pos += words[wi].Length + 1; }
+
+                    int WordIndexForOffset(int offset)
+                    {
+                        int found = 0;
+                        for (int wi = 0; wi < wordStart.Length; wi++)
+                        {
+                            if (wordStart[wi] <= offset) found = wi; else break;
+                        }
+                        return found;
+                    }
+
+                    foreach (var pair in pairs)
+                    {
+                        int openWord = WordIndexForOffset(pair.OpenStart);
+                        int closeWord = WordIndexForOffset(pair.CloseStart);
+                        int openLine = wordToLine[openWord];
+                        int closeLine = wordToLine[closeWord];
+                        if (openLine == closeLine) continue; // whole pair on one line already: leave as-is
+
+                        string openTagText = paragraph.Substring(pair.OpenStart, pair.OpenEnd - pair.OpenStart + 1);
+                        string closeTagText = paragraph.Substring(pair.CloseStart, pair.CloseEnd - pair.CloseStart + 1);
+
+                        for (int L = openLine; L < closeLine; L++)
+                        {
+                            if (!outputLines[L].TrimEnd().EndsWith(closeTagText))
+                                outputLines[L] = outputLines[L] + closeTagText;
+                        }
+                        for (int L = openLine + 1; L <= closeLine; L++)
+                        {
+                            if (!outputLines[L].TrimStart().StartsWith(openTagText))
+                                outputLines[L] = openTagText + outputLines[L];
+                        }
+                    }
+                }
+
+                allOutputLines.AddRange(outputLines);
             }
 
-            string rebuilt = string.Join("\n", outputLines);
+            string rebuilt = string.Join("\n", allOutputLines);
             return ArabicFixer.Fix(useArabicIndicDigits ? ToArabicIndicDigits(rebuilt) : rebuilt);
         }
 
@@ -233,6 +305,15 @@ namespace ArabicUnityRTL.Unity
         {
             if (Text == null) return;
 
+            ApplyAlignment();
+
+            // Reversed-tag normalization happens FIRST, before either the
+            // wrapped or non-wrapped path runs, since both the wrap-line
+            // tag-matching logic and the main Fix() pipeline expect
+            // standard "<tag>content</tag>" order - not the "</tag>...
+            // <tag>" order some RTL editors produce.
+            string workingText = reverseTags ? ArabicFixer.NormalizeReversedTags(sourceText) : sourceText;
+
             if (rtlWrap)
             {
                 Text.enableWordWrapping = false;
@@ -240,7 +321,7 @@ namespace ArabicUnityRTL.Unity
                 if (maxWidth > 0f)
                 {
                     if (!fixedWrap) _lastLiveWidth = maxWidth;
-                    Text.text = BuildWrappedProcessedText(sourceText, maxWidth);
+                    Text.text = BuildWrappedProcessedText(workingText, maxWidth);
                     return;
                 }
                 // RectTransform width isn't known yet this frame (e.g. layout
@@ -248,8 +329,27 @@ namespace ArabicUnityRTL.Unity
                 // self-correct on the next OnRectTransformDimensionsChange.
             }
 
-            string processed = ArabicFixer.Fix(useArabicIndicDigits ? ToArabicIndicDigits(sourceText) : sourceText);
+            string processed = ArabicFixer.Fix(useArabicIndicDigits ? ToArabicIndicDigits(workingText) : workingText);
             Text.text = processed;
+        }
+
+        /// <summary>
+        /// Sets the TMP component's default horizontal alignment to Right or
+        /// Left per the Align Right / Always Right toggles, preserving
+        /// whatever vertical alignment (Top/Middle/Bottom/etc) is already
+        /// set. TextAlignmentOptions packs horizontal bits in the low byte
+        /// (Left/Center/Right/Justified/Flush/Geometry) and vertical bits
+        /// above that, so only the low-byte bits get replaced here.
+        /// </summary>
+        private void ApplyAlignment()
+        {
+            if (Text == null) return;
+            bool useRight = alwaysRight || alignRight;
+
+            int current = (int)Text.alignment;
+            int verticalBits = current & ~0x3F; // clear horizontal bits, keep everything else
+            int horizontalBit = (int)(useRight ? HorizontalAlignmentOptions.Right : HorizontalAlignmentOptions.Left);
+            Text.alignment = (TextAlignmentOptions)(verticalBits | horizontalBit);
         }
 
         private static string ToArabicIndicDigits(string s)
