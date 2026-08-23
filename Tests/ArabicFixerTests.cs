@@ -205,4 +205,134 @@ public class ArabicFixerTests
         Assert.AreEqual('\u064C', result[0],
             "the tanween must be the first character of the output, immediately preceding ain's glyph - not stranded after beh's glyph");
     }
+
+    // --- Regression tests for the "wrapping tag around multiple words gets
+    // its open/close halves swapped" bug ---
+    // A tag wrapping an entire multi-word RTL span used to have its opening
+    // and closing tags end up on the WRONG ends after word-order reversal,
+    // since each half stayed glued to whichever word originally sat at that
+    // edge, and reversal swapped those words' positions right along with
+    // their attached tag halves.
+
+    [Test]
+    public void WrappingTagAroundMultipleArabicWords_KeepsOpenBeforeClose()
+    {
+        string input = "<align=\"center\">\u064A\u062A\u062D\u0631\u0643 \u0645\u0631\u0628\u0639</align>"; // <align="center">يتحرك مربع</align>
+        string result = ArabicFixer.Fix(input);
+        int openIdx = result.IndexOf("<align=\"center\">");
+        int closeIdx = result.LastIndexOf("</align>");
+        Assert.AreNotEqual(-1, openIdx);
+        Assert.AreNotEqual(-1, closeIdx);
+        Assert.Less(openIdx, closeIdx, "the opening tag must still come before the closing tag after reversal");
+    }
+
+    [Test]
+    public void WrappingTagAroundWordWithTrailingArabicPunctuation_StaysIntact()
+    {
+        // The word carries a trailing Arabic comma ("،", classified as
+        // Neutral, not Arabic) glued directly onto it with no space - this
+        // used to break the tag-duplication chain right before reaching the
+        // closing tag.
+        string input = "<align=\"center\">\u0644\u0644\u0623\u0645\u0627\u0645\u060C \u0648\u064A\u0642\u0636\u064A</align>"; // <align="center">للأمام، ويقضي</align>
+        string result = ArabicFixer.Fix(input);
+        StringAssert.Contains("<align=\"center\">", result);
+        StringAssert.Contains("</align>", result);
+        Assert.IsTrue(result.IndexOf("<align=\"center\">") < result.LastIndexOf("</align>"));
+    }
+
+    [Test]
+    public void WrappingTagAroundEmbeddedNumber_IsNotReversedIntoWrongDigitOrder()
+    {
+        // A bare number wrapped in its own duplicated tag pair, inside an
+        // Arabic sentence, must never have its OWN digit order reversed
+        // (e.g. "45" must never become "54") - reversal must only ever
+        // apply to genuinely Arabic content.
+        string input = "\u0628\u0632\u0627\u0648\u064A\u0629 <align=\"center\">45</align> \u062F\u0631\u062C\u0629"; // بزاوية <align="center">45</align> درجة
+        string result = ArabicFixer.Fix(input);
+        StringAssert.Contains("<align=\"center\">45</align>", result);
+    }
+
+    // --- Regression tests for the "conservative" tag handling redesign ---
+    // A tag wrapping several words that all fit on ONE physical line must
+    // come out as exactly ONE open + ONE close, in the originally-authored
+    // order, with only the CONTENT inside correctly reordered - never
+    // duplicated per word.
+
+    [Test]
+    public void MultiWordTagOnOneLine_ProducesExactlyOnePairInCorrectOrder()
+    {
+        string input = "<align=\"right\">\u0645\u062D\u0645\u062F \u0644\u0635 \u0643\u064A \u0645\u0635\u0631</align>"; // <align="right">محمد لص كي مصر</align>
+        string result = ArabicFixer.Fix(input);
+        int openCount = 0, idx = 0;
+        while ((idx = result.IndexOf("<align=\"right\">", idx)) != -1) { openCount++; idx++; }
+        int closeCount = 0; idx = 0;
+        while ((idx = result.IndexOf("</align>", idx)) != -1) { closeCount++; idx++; }
+        Assert.AreEqual(1, openCount, "exactly one opening tag - no per-word duplication");
+        Assert.AreEqual(1, closeCount, "exactly one closing tag - no per-word duplication");
+        Assert.Less(result.IndexOf("<align=\"right\">"), result.IndexOf("</align>"));
+    }
+
+    [Test]
+    public void PureEnglishMultiWordTag_IsLeftCompletelyUnchanged()
+    {
+        // A tag wrapping several English words with no Arabic inside at all
+        // must be returned byte-for-byte identical - no reversal, no
+        // reshaping, no duplication.
+        string input = "<align=\"right\">apple is ded</align>";
+        string result = ArabicFixer.Fix(input);
+        Assert.AreEqual(input, result);
+    }
+
+    [Test]
+    public void NestedTags_BothPreserveExactlyOnePairEach()
+    {
+        string input = "<b><align=\"right\">\u0645\u0631\u062D\u0628\u0627</align></b>"; // <b><align="right">مرحبا</align></b>
+        string result = ArabicFixer.Fix(input);
+        StringAssert.StartsWith("<b><align=\"right\">", result);
+        StringAssert.EndsWith("</align></b>", result);
+    }
+
+    // --- Tests for NormalizeReversedTags (the "Reverse Tags" toggle) ---
+
+    [Test]
+    public void NormalizeReversedTags_SimpleReversedPair_BecomesStandardOrder()
+    {
+        string input = "</align>\u0645\u062D\u0645\u062F<align=\"right\">"; // </align>محمد<align="right">
+        string result = ArabicFixer.NormalizeReversedTags(input);
+        Assert.AreEqual("<align=\"right\">\u0645\u062D\u0645\u062F</align>", result);
+    }
+
+    [Test]
+    public void NormalizeReversedTags_NestedReversedPairs_BothUnnested()
+    {
+        string input = "</align></b>\u0645\u0631\u062D\u0628\u0627<b><align=\"right\">"; // </align></b>مرحبا<b><align="right">
+        string result = ArabicFixer.NormalizeReversedTags(input);
+        Assert.AreEqual("<align=\"right\"><b>\u0645\u0631\u062D\u0628\u0627</b></align>", result);
+    }
+
+    [Test]
+    public void NormalizeReversedTags_VoidTagInside_LeftUntouched()
+    {
+        string input = "</align>hello<sprite name=\"x\"> world<align=\"right\">";
+        string result = ArabicFixer.NormalizeReversedTags(input);
+        Assert.AreEqual("<align=\"right\">hello<sprite name=\"x\"> world</align>", result);
+    }
+
+    [Test]
+    public void NormalizeReversedTags_ThenFix_ProducesCorrectSinglePair()
+    {
+        string input = "</align>\u0645\u062D\u0645\u062F \u0644\u0635 \u0643\u064A<align=\"right\">"; // </align>محمد لص كي<align="right">
+        string normalized = ArabicFixer.NormalizeReversedTags(input);
+        string result = ArabicFixer.Fix(normalized);
+        Assert.AreEqual(1, CountOccurrences(result, "<align=\"right\">"));
+        Assert.AreEqual(1, CountOccurrences(result, "</align>"));
+        Assert.Less(result.IndexOf("<align=\"right\">"), result.IndexOf("</align>"));
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        int count = 0, idx = 0;
+        while ((idx = haystack.IndexOf(needle, idx)) != -1) { count++; idx += needle.Length; }
+        return count;
+    }
 }
